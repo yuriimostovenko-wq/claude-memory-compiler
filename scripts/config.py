@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 
 # ── Paths ──────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
+NEARYA_ROOT = ROOT_DIR.parent          # /SynologyDrive/Nearya/
+RAW_DIR = NEARYA_ROOT / "raw"          # raw local sources (md only; PDFs processed separately)
 DAILY_DIR = ROOT_DIR / "daily"
 KNOWLEDGE_DIR = ROOT_DIR / "knowledge"
 CONCEPTS_DIR = KNOWLEDGE_DIR / "concepts"

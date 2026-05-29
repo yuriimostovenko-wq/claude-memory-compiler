@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import time
 import sys
 from pathlib import Path
 
-from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, now_iso
+from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, RAW_DIR, now_iso
 from utils import (
     file_hash,
     list_raw_files,
@@ -132,6 +133,7 @@ Read the daily log above and compile it into wiki articles following the schema 
         async for message in query(
             prompt=prompt,
             options=ClaudeAgentOptions(
+                model="claude-haiku-4-5-20251001",
                 cwd=str(ROOT_DIR),
                 system_prompt={"type": "preset", "preset": "claude_code"},
                 allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
@@ -163,14 +165,166 @@ Read the daily log above and compile it into wiki articles following the schema 
     return cost
 
 
+BINARY_SUFFIXES = {".pdf", ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt",
+                   ".png", ".jpg", ".jpeg", ".gif", ".webp", ".zip", ".tar"}
+
+
+async def compile_raw_source(raw_path: Path, state: dict) -> float:
+    """Compile a single markdown file from /raw into knowledge articles.
+
+    Binary files (PDF, DOCX, etc.) are skipped — process them via skills first.
+    Returns the API cost.
+    """
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ClaudeAgentOptions,
+        ResultMessage,
+        TextBlock,
+        query,
+    )
+
+    if raw_path.suffix.lower() in BINARY_SUFFIXES:
+        print(f"  SKIP (binary): {raw_path.name} — use pdf-viewer/office-docx skill first")
+        return 0.0
+
+    content = raw_path.read_text(encoding="utf-8")
+    schema = AGENTS_FILE.read_text(encoding="utf-8")
+    wiki_index = read_wiki_index()
+
+    existing_articles_context = ""
+    existing = {}
+    for article_path in list_wiki_articles():
+        rel = article_path.relative_to(KNOWLEDGE_DIR)
+        existing[str(rel)] = article_path.read_text(encoding="utf-8")
+    if existing:
+        parts = [f"### {p}\n```markdown\n{c}\n```" for p, c in existing.items()]
+        existing_articles_context = "\n\n".join(parts)
+
+    timestamp = now_iso()
+
+    prompt = f"""You are a knowledge compiler processing a raw source document from the project's /raw folder.
+
+## Schema (AGENTS.md)
+
+{schema}
+
+## Current Wiki Index
+
+{wiki_index}
+
+## Existing Wiki Articles
+
+{existing_articles_context if existing_articles_context else "(No existing articles yet)"}
+
+## Raw Source Document to Compile
+
+**File:** raw/{raw_path.name}
+
+{content}
+
+## Your Task
+
+Extract knowledge from this raw document into structured wiki articles.
+
+### Rules:
+1. **Extract key concepts** - Identify concepts worth their own article
+2. **Create concept articles** in `knowledge/concepts/` with YAML frontmatter
+   - Set `sources: ["raw/{raw_path.name}"]` in frontmatter
+   - Write encyclopedia style, use [[wikilinks]]
+3. **Create connection articles** in `knowledge/connections/` for non-obvious cross-concept links
+4. **Update existing articles** if this document adds new information
+5. **Update knowledge/index.md** with new entries
+6. **Append to knowledge/log.md**:
+   ```
+   ## [{timestamp}] compile-raw | {raw_path.name}
+   - Source: raw/{raw_path.name}
+   - Articles created: [[concepts/x]]
+   - Articles updated: (if any)
+   ```
+
+### File paths:
+- Write concept articles to: {CONCEPTS_DIR}
+- Write connection articles to: {CONNECTIONS_DIR}
+- Update index at: {KNOWLEDGE_DIR / 'index.md'}
+- Append log at: {KNOWLEDGE_DIR / 'log.md'}
+"""
+
+    cost = 0.0
+    try:
+        async for message in query(
+            prompt=prompt,
+            options=ClaudeAgentOptions(
+                model="claude-haiku-4-5-20251001",
+                cwd=str(ROOT_DIR),
+                system_prompt={"type": "preset", "preset": "claude_code"},
+                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
+                permission_mode="acceptEdits",
+                max_turns=30,
+            ),
+        ):
+            if isinstance(message, ResultMessage):
+                cost = message.total_cost_usd or 0.0
+                print(f"  Cost: ${cost:.4f}")
+    except Exception as e:
+        print(f"  Error: {e}")
+        return 0.0
+
+    state.setdefault("raw_ingested", {})[raw_path.name] = {
+        "hash": file_hash(raw_path),
+        "compiled_at": now_iso(),
+        "cost_usd": cost,
+    }
+    state["total_cost"] = state.get("total_cost", 0.0) + cost
+    save_state(state)
+    return cost
+
+
+def list_raw_markdown_files() -> list[Path]:
+    """List markdown files in /raw, skip binaries."""
+    if not RAW_DIR.exists():
+        return []
+    return sorted(p for p in RAW_DIR.iterdir()
+                  if p.is_file() and p.suffix.lower() == ".md")
+
+
+def list_raw_binaries() -> list[Path]:
+    """List binary files in /raw that need manual skill processing."""
+    if not RAW_DIR.exists():
+        return []
+    return sorted(p for p in RAW_DIR.iterdir()
+                  if p.is_file() and p.suffix.lower() in BINARY_SUFFIXES)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compile daily logs into knowledge articles")
     parser.add_argument("--all", action="store_true", help="Force recompile all logs")
     parser.add_argument("--file", type=str, help="Compile a specific daily log file")
+    parser.add_argument("--raw", action="store_true", help="Also compile markdown files from /raw")
+    parser.add_argument("--raw-file", type=str, help="Compile a specific file from /raw (name only, e.g. IP_Box_Verification_v1.md)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be compiled")
     args = parser.parse_args()
 
     state = load_state()
+
+    # --raw-file: compile a single specific raw file
+    if args.raw_file:
+        name = Path(args.raw_file).name
+        target = RAW_DIR / name
+        if not target.exists():
+            print(f"Error: {name} not found in {RAW_DIR}")
+            print(f"Available .md files in /raw:")
+            for p in sorted(RAW_DIR.glob("*.md")):
+                compiled = "✓" if state.get("raw_ingested", {}).get(p.name) else "○"
+                print(f"  {compiled} {p.name}")
+            sys.exit(1)
+        if args.dry_run:
+            print(f"[DRY RUN] Would compile: raw/{name}")
+            return
+        print(f"Compiling raw/{name}...")
+        cost = asyncio.run(compile_raw_source(target, state))
+        articles = list_wiki_articles()
+        print(f"\nDone. Cost: ${cost:.4f} | Knowledge base: {len(articles)} articles")
+        return
 
     # Determine which files to compile
     if args.file:
@@ -196,24 +350,53 @@ def main():
                 if not prev or prev.get("hash") != file_hash(log_path):
                     to_compile.append(log_path)
 
-    if not to_compile:
-        print("Nothing to compile - all daily logs are up to date.")
+    # --raw: find new/changed markdown files in /raw
+    raw_to_compile: list[Path] = []
+    if args.raw:
+        raw_md = list_raw_markdown_files()
+        raw_bins = list_raw_binaries()
+        if raw_bins:
+            print(f"  /raw binaries (need skill processing first): "
+                  + ", ".join(p.name for p in raw_bins))
+        for raw_path in raw_md:
+            prev = state.get("raw_ingested", {}).get(raw_path.name, {})
+            if args.all or not prev or prev.get("hash") != file_hash(raw_path):
+                raw_to_compile.append(raw_path)
+
+    if not to_compile and not raw_to_compile:
+        print("Nothing to compile - all logs and /raw sources are up to date.")
         return
 
-    print(f"{'[DRY RUN] ' if args.dry_run else ''}Files to compile ({len(to_compile)}):")
-    for f in to_compile:
-        print(f"  - {f.name}")
+    if to_compile:
+        print(f"{'[DRY RUN] ' if args.dry_run else ''}Daily logs to compile ({len(to_compile)}):")
+        for f in to_compile:
+            print(f"  - {f.name}")
+    if raw_to_compile:
+        print(f"{'[DRY RUN] ' if args.dry_run else ''}/raw sources to compile ({len(raw_to_compile)}):")
+        for f in raw_to_compile:
+            print(f"  - raw/{f.name}")
 
     if args.dry_run:
         return
 
-    # Compile each file sequentially
     total_cost = 0.0
+    INTER_FILE_DELAY = 8  # seconds between files to avoid rate limiting
+
     for i, log_path in enumerate(to_compile, 1):
         print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
         cost = asyncio.run(compile_daily_log(log_path, state))
         total_cost += cost
         print(f"  Done.")
+        if i < len(to_compile) or raw_to_compile:
+            time.sleep(INTER_FILE_DELAY)
+
+    for i, raw_path in enumerate(raw_to_compile, 1):
+        print(f"\n[raw {i}/{len(raw_to_compile)}] Compiling raw/{raw_path.name}...")
+        cost = asyncio.run(compile_raw_source(raw_path, state))
+        total_cost += cost
+        print(f"  Done.")
+        if i < len(raw_to_compile):
+            time.sleep(INTER_FILE_DELAY)
 
     articles = list_wiki_articles()
     print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")

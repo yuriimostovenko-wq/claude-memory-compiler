@@ -7,6 +7,7 @@
 
 ```
 daily/          = source code    (your conversations - the raw material)
+raw/            = source code    (external documents, markdown notes - project root)
 LLM             = compiler       (extracts and organizes knowledge)
 knowledge/      = executable     (structured, queryable knowledge base)
 lint            = test suite     (health checks for consistency)
@@ -18,6 +19,25 @@ You don't manually organize your knowledge. You have conversations, and the LLM 
 ---
 
 ## Architecture
+
+### Layer 0: `../raw/` - External Raw Sources (Project Root)
+
+The parent project keeps a `/raw` folder for source documents that are not Claude conversation logs. This is a **separate input layer** alongside `daily/`.
+
+**Rules for `/raw`:**
+- **Markdown files (`.md`)** — compiled directly via `compile.py --raw`. The LLM reads them and extracts knowledge into `knowledge/concepts/`.
+- **Binary files (PDF, DOCX, XLSX, images)** — **never read directly during normal conversations**. Process them first using the appropriate skill (pdf-viewer, office-docx, office-xlsx), save the extracted text as a `.md` file in `/raw`, then run `compile.py --raw`.
+- Original files in `/raw` are immutable — treat as read-only sources.
+- Source attribution in compiled articles must reference `raw/<filename>` in the `sources:` frontmatter field.
+
+**CLI:**
+```bash
+uv run python scripts/compile.py --raw            # compile new/changed /raw markdown
+uv run python scripts/compile.py --raw --all      # force recompile all /raw markdown
+uv run python scripts/compile.py --raw --dry-run  # preview without writing
+```
+
+---
 
 ### Layer 1: `daily/` - Conversation Logs (Immutable Source)
 
